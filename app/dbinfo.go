@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os"
 	"strings"
 )
@@ -12,11 +13,12 @@ type dbInfo struct {
 	tableCount int
 }
 
-// schemaRow holds the first two columns of a sqlite_schema record.
+// schemaRow holds the first four columns of a sqlite_schema record.
 // sqlite_schema column order: type, name, tbl_name, rootpage, sql
 type schemaRow struct {
-	typ  string // "table", "index", "view", "trigger"
-	name string // e.g. "apples", "oranges"
+	typ      string // "table", "index", "view", "trigger"
+	name     string // e.g. "apples", "oranges"
+	rootpage int    // page number where the table's B-tree root lives
 }
 
 // readDbInfo reads the page size and number of tables from a SQLite database file.
@@ -166,22 +168,33 @@ func parseSchemaRow(page1 []byte, cellOffset int) schemaRow {
 	headerLen, n := readVarint(page1, pos)
 	pos += n
 
-	// Read serial types for col 0 (type) and col 1 (name).
+	// Read serial types for col 0 (type), 1 (name), 2 (tbl_name), 3 (rootpage).
 	serialType0, n := readVarint(page1, pos)
 	pos += n
-	serialType1, _ := readVarint(page1, pos)
+	serialType1, n := readVarint(page1, pos)
+	pos += n
+	serialType2, n := readVarint(page1, pos)
+	pos += n
+	serialType3, _ := readVarint(page1, pos)
 
 	// Values section starts at recordStart + headerLen.
 	valPos := recordStart + int(headerLen)
 
-	// Decode col 0 (type) — TEXT: odd >= 13, length = (N-13)/2
+	// Decode col 0 (type) — TEXT
 	col0 := readTextValue(page1, valPos, serialType0)
 	valPos += textByteLen(serialType0)
 
-	// Decode col 1 (name) — same encoding
+	// Decode col 1 (name) — TEXT
 	col1 := readTextValue(page1, valPos, serialType1)
+	valPos += textByteLen(serialType1)
 
-	return schemaRow{typ: col0, name: col1}
+	// Skip col 2 (tbl_name) — TEXT, same length formula
+	valPos += textByteLen(serialType2)
+
+	// Decode col 3 (rootpage) — INTEGER
+	rootpage := readIntValue(page1, valPos, serialType3)
+
+	return schemaRow{typ: col0, name: col1, rootpage: int(rootpage)}
 }
 
 // readTextValue extracts a TEXT value from page data given its serial type.
@@ -203,3 +216,100 @@ func textByteLen(serialType int64) int {
 	return int((serialType - 13) / 2)
 }
 
+// intByteLen returns the byte length of an INTEGER serial type.
+//
+// Serial type → storage size (from sqlite.org/fileformat.html):
+//
+//	1 → 1 byte,  2 → 2 bytes,  3 → 3 bytes,  4 → 4 bytes
+//	5 → 6 bytes, 6 → 8 bytes,  8 → 0 (value 0), 9 → 0 (value 1)
+func intByteLen(serialType int64) int {
+	switch serialType {
+	case 1:
+		return 1
+	case 2:
+		return 2
+	case 3:
+		return 3
+	case 4:
+		return 4
+	case 5:
+		return 6
+	case 6:
+		return 8
+	default:
+		return 0
+	}
+}
+
+// readIntValue reads a big-endian integer from data at offset given its serial type.
+// Serial types 8 and 9 encode the constants 0 and 1 with no stored bytes.
+func readIntValue(data []byte, offset int, serialType int64) int64 {
+	if serialType == 8 {
+		return 0
+	}
+	if serialType == 9 {
+		return 1
+	}
+	n := intByteLen(serialType)
+	var result int64
+	for i := range n {
+		result = (result << 8) | int64(data[offset+i])
+	}
+	return result
+}
+
+// countTableRows returns the number of rows in tableName by reading its root B-tree page.
+// from https://askclees.com/2020/11/20/sqlite-databases-at-hex-level/, we have this connection:
+// rootpage = which page in the file holds that table's B-tree root (every table in sqlite is btree).
+// Navigate to that page: file offset = (rootpage - 1) * pageSize
+// from now, cell count = number of rows in the table (each cell in a leaf page = one row)
+// Steps:
+//  1. Read sqlite_schema to find the table's rootpage number.
+//  2. Seek to (rootpage-1)*pageSize — pages are 1-indexed, so page 2 starts at 1*pageSize.
+//  3. Read the B-tree page header bytes 3-4 (cell count).
+//     For a leaf table page (0x0D), each cell = one row, so cell count = row count.
+func countTableRows(path, tableName string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	pageSize, err := readPageSize(f)
+	if err != nil {
+		return 0, err
+	}
+
+	page1, err := readPage1(f, pageSize)
+	if err != nil {
+		return 0, err
+	}
+
+	rootpage := -1
+	for _, row := range parseSchemaRows(page1) {
+		if row.typ == "table" && row.name == tableName {
+			rootpage = row.rootpage
+			break
+		}
+	}
+	if rootpage == -1 {
+		return 0, fmt.Errorf("table %q not found", tableName)
+	}
+
+	// Navigate to the rootpage. Page numbers are 1-indexed:
+	//   page 1 → offset 0, page 2 → offset pageSize, page N → offset (N-1)*pageSize
+	offset := int64(rootpage-1) * int64(pageSize)
+	if _, err := f.Seek(offset, 0); err != nil {
+		return 0, err
+	}
+	page := make([]byte, pageSize)
+	if _, err := f.Read(page); err != nil {
+		return 0, err
+	}
+
+	// B-tree page header starts at offset 0 for every page except page 1.
+	// search "number of cells" in https://askclees.com/2020/11/20/sqlite-databases-at-hex-level/
+	// Bytes 3-4 = cell count = number of rows (for a leaf table page).
+	cellCount := int(binary.BigEndian.Uint16(page[3:5]))
+	return cellCount, nil
+}

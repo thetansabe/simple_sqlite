@@ -31,7 +31,24 @@ func main() {
 		fmt.Println(strings.Join(names, " "))
 
 	default:
-		fmt.Println("Unknown command", command)
-		os.Exit(1)
+		// Treat anything else as a SQL query, e.g. "SELECT COUNT(*) FROM apples"
+		tableName := extractTableName(command)
+		count, err := countTableRows(databaseFilePath, tableName)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(count)
 	}
+}
+
+// extractTableName extracts the table name from "SELECT COUNT(*) FROM <table>".
+// Finds the token immediately after the FROM keyword (case-insensitive).
+func extractTableName(query string) string {
+	fields := strings.Fields(query)
+	for i, f := range fields {
+		if strings.ToUpper(f) == "FROM" && i+1 < len(fields) {
+			return fields[i+1]
+		}
+	}
+	return ""
 }
