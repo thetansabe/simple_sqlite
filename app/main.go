@@ -39,6 +39,9 @@ func main() {
 
 		// TODO: Uncomment the code below to pass the first stage
 		fmt.Printf("database page size: %v", pageSize)
+
+		tables := binary.BigEndian.Uint16(header[103:105])
+		fmt.Println("number of tables: ", tables)
 	default:
 		fmt.Println("Unknown command", command)
 		os.Exit(1)
