@@ -5,8 +5,6 @@ import (
 	"log"
 	"os"
 	"strings"
-	// Available if you need it!
-	// "github.com/xwb1989/sqlparser"
 )
 
 // Usage: your_program.sh sample.db .dbinfo
@@ -31,24 +29,24 @@ func main() {
 		fmt.Println(strings.Join(names, " "))
 
 	default:
-		// Treat anything else as a SQL query, e.g. "SELECT COUNT(*) FROM apples"
-		tableName := extractTableName(command)
-		count, err := countTableRows(databaseFilePath, tableName)
+		// Treat anything else as a SQL SELECT query.
+		q, err := parseSelect(command)
 		if err != nil {
 			log.Fatal(err)
 		}
-		fmt.Println(count)
-	}
-}
 
-// extractTableName extracts the table name from "SELECT COUNT(*) FROM <table>".
-// Finds the token immediately after the FROM keyword (case-insensitive).
-func extractTableName(query string) string {
-	fields := strings.Fields(query)
-	for i, f := range fields {
-		if strings.ToUpper(f) == "FROM" && i+1 < len(fields) {
-			return fields[i+1]
+		if q.isCount {
+			// SELECT COUNT(*) FROM <table>
+			count, err := countTableRows(databaseFilePath, q.table)
+			if err != nil {
+				log.Fatal(err)
+			}
+			fmt.Println(count)
+		} else {
+			// SELECT col1, col2, ... FROM <table>
+			if err := executeSelect(databaseFilePath, q); err != nil {
+				log.Fatal(err)
+			}
 		}
 	}
-	return ""
 }

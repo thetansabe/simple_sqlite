@@ -13,12 +13,13 @@ type dbInfo struct {
 	tableCount int
 }
 
-// schemaRow holds the first four columns of a sqlite_schema record.
+// schemaRow holds all five columns of a sqlite_schema record.
 // sqlite_schema column order: type, name, tbl_name, rootpage, sql
 type schemaRow struct {
 	typ      string // "table", "index", "view", "trigger"
 	name     string // e.g. "apples", "oranges"
 	rootpage int    // page number where the table's B-tree root lives
+	sql      string // original CREATE TABLE / CREATE INDEX statement
 }
 
 // readDbInfo reads the page size and number of tables from a SQLite database file.
@@ -168,14 +169,16 @@ func parseSchemaRow(page1 []byte, cellOffset int) schemaRow {
 	headerLen, n := readVarint(page1, pos)
 	pos += n
 
-	// Read serial types for col 0 (type), 1 (name), 2 (tbl_name), 3 (rootpage).
+	// Read serial types for col 0 (type), 1 (name), 2 (tbl_name), 3 (rootpage), 4 (sql).
 	serialType0, n := readVarint(page1, pos)
 	pos += n
 	serialType1, n := readVarint(page1, pos)
 	pos += n
 	serialType2, n := readVarint(page1, pos)
 	pos += n
-	serialType3, _ := readVarint(page1, pos)
+	serialType3, n := readVarint(page1, pos)
+	pos += n
+	serialType4, _ := readVarint(page1, pos)
 
 	// Values section starts at recordStart + headerLen.
 	valPos := recordStart + int(headerLen)
@@ -193,8 +196,12 @@ func parseSchemaRow(page1 []byte, cellOffset int) schemaRow {
 
 	// Decode col 3 (rootpage) — INTEGER
 	rootpage := readIntValue(page1, valPos, serialType3)
+	valPos += intByteLen(serialType3)
 
-	return schemaRow{typ: col0, name: col1, rootpage: int(rootpage)}
+	// Decode col 4 (sql) — TEXT, the original CREATE TABLE statement
+	createSQL := readTextValue(page1, valPos, serialType4)
+
+	return schemaRow{typ: col0, name: col1, rootpage: int(rootpage), sql: createSQL}
 }
 
 // readTextValue extracts a TEXT value from page data given its serial type.
