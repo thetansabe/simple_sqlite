@@ -27,6 +27,28 @@ You collect 7 data bits from each byte and glue them together until FLAG = 0.
 
 ---
 
+## Why the loop is `i < 9` (not 8 or 10)
+
+From the **official SQLite file format docs** ([sqlite.org/fileformat.html](https://www.sqlite.org/fileformat.html)):
+
+> *"The lower seven bits of each of the first **eight bytes** and all **8 bits
+> of the ninth byte** are used to reconstruct the 64-bit twos-complement integer."*
+
+So the math is fixed:
+
+```
+bytes 1–8:  8 × 7 bits = 56 bits
+byte 9:     1 × 8 bits =  8 bits  (no FLAG, all data)
+                         ────────
+total:                    64 bits  = exactly int64
+```
+
+9 bytes is the **minimum** needed to cover all possible int64 values. Not 8
+(8×7=56, not enough), not 10 (unnecessary). The 9th byte also has no FLAG bit
+because there is no 10th byte — it just uses all 8 bits directly.
+
+---
+
 ## Concrete example 1 — single byte (value = 42)
 
 42 in binary = `010 1010` → fits in 7 bits → only 1 byte needed
@@ -154,43 +176,79 @@ result = (result << 8) | int64(b)
 
 ## How is this different from LEB128 (used in Kafka / Protobuf)?
 
-Both solve the same problem (compact integer encoding) but differ in two ways:
+Both use the same FLAG bit trick (`bit7=1` → more bytes, `bit7=0` → last byte),
+but differ in **byte order** and **how signed integers work**.
+
+See your Kafka notes for a full LEB128 walkthrough:
+`/Users/ntdien/workplace/codecrafters-kafka-go/questions/leb123.md`
 
 ### 1. Byte order — LSB first vs MSB first
 
-| Format        | Order              | Example: encode `1000` |
-|---------------|--------------------|------------------------|
-| **LEB128**    | Least significant chunk first | byte1=`0xe8`, byte2=`0x07` |
-| **SQLite varint** | Most significant chunk first | byte1=`0x87`, byte2=`0x68` |
+Same value `1024`, encoded both ways:
 
-LEB128 puts the smallest bits first (little-endian style). SQLite puts the
-biggest bits first (big-endian style, matching the rest of its file format).
-
-Decoding LEB128 you OR into an accumulator with a growing shift:
 ```
-result |= (chunk << (7 * i))   // shift grows each iteration
+1024 in binary = 100_0000000  (10 bits)
+
+Split into two 7-bit chunks:
+  chunk A = 000_1000  (high bits)
+  chunk B = 000_0000  (low bits)
 ```
 
-Decoding SQLite varint you shift the accumulator and OR the new chunk in:
+**LEB128 — low chunk first:**
 ```
-result = (result << 7) | chunk  // shift is always 7, applied to result
+byte[0] = chunk B + FLAG=1  →  1_000_0000  =  0x80   ← small bits first
+byte[1] = chunk A + FLAG=0  →  0_000_1000  =  0x08   ← big bits second
+
+on disk:  0x80  0x08
+
+decode:
+  i=0: result |= 0x00 << 0  =  0
+  i=1: result |= 0x08 << 7  =  1024  ✓
 ```
 
-### 2. Signed vs unsigned
+**SQLite varint — high chunk first:**
+```
+byte[0] = chunk A + FLAG=1  →  1_000_1000  =  0x88   ← big bits first
+byte[1] = chunk B + FLAG=0  →  0_000_0000  =  0x00   ← small bits second
 
-| Format | Signed? | How |
-|--------|---------|-----|
-| **LEB128 unsigned** | No | raw bits |
-| **LEB128 signed** | Yes | sign-extends the last byte |
-| **SQLite varint** | Yes | treats the 64-bit result as int64 |
+on disk:  0x88  0x00
 
-Kafka uses *zigzag + LEB128* for signed integers (maps negative → positive
-before encoding). SQLite varints are just stored as their raw int64 bit pattern.
+decode:
+  i=0: result = (0 << 7) | 8  =  8
+  i=1: result = (8 << 7) | 0  =  1024  ✓
+```
+
+Side by side — same two bytes, swapped order:
+```
+Value 1024    byte[0]    byte[1]
+─────────────────────────────────
+LEB128         0x80       0x08    ← small bits first, big bits second
+SQLite         0x88       0x00    ← big bits first,   small bits second
+```
+
+| Format | Byte order | Decode pattern |
+|--------|-----------|----------------|
+| **LEB128** | LSB first (little-endian) | `result \|= chunk << (7*i)` |
+| **SQLite varint** | MSB first (big-endian) | `result = (result << 7) \| chunk` |
+
+SQLite is big-endian throughout its file format — varints follow the same convention.
+
+### 2. Signed integers
+
+| Format | How |
+|--------|-----|
+| **LEB128 unsigned** | raw bits |
+| **LEB128 signed** | zigzag encoding: `(n << 1) ^ (n >> 31)` |
+| **SQLite varint** | raw int64 bit pattern |
+
+Kafka uses zigzag so that `-1` encodes to `1`, `-2` to `3` (small absolute values
+stay small). SQLite varints store the raw two's complement, so negative numbers
+always use all 9 bytes.
 
 ### 3. Max size
 
-Both cap at 9 bytes (enough for int64), but for different reasons:
-- LEB128: 9 × 7 = 63 bits + sign = 64-bit signed
+Both cap at 9 bytes:
+- LEB128:        9 × 7 = 63 bits + sign bit = 64-bit signed
 - SQLite varint: 8 × 7 + 8 = 64 bits exactly
 
 ---
