@@ -17,7 +17,8 @@ type dbInfo struct {
 // sqlite_schema column order: type, name, tbl_name, rootpage, sql
 type schemaRow struct {
 	typ      string // "table", "index", "view", "trigger"
-	name     string // e.g. "apples", "oranges"
+	name     string // e.g. "apples", "idx_companies_country"
+	tblName  string // table this row belongs to (same as name for tables; the indexed table for indexes)
 	rootpage int    // page number where the table's B-tree root lives
 	sql      string // original CREATE TABLE / CREATE INDEX statement
 }
@@ -191,7 +192,8 @@ func parseSchemaRow(page1 []byte, cellOffset int) schemaRow {
 	col1 := readTextValue(page1, valPos, serialType1)
 	valPos += textByteLen(serialType1)
 
-	// Skip col 2 (tbl_name) — TEXT, same length formula
+	// Decode col 2 (tbl_name) — TEXT
+	col2 := readTextValue(page1, valPos, serialType2)
 	valPos += textByteLen(serialType2)
 
 	// Decode col 3 (rootpage) — INTEGER
@@ -201,7 +203,7 @@ func parseSchemaRow(page1 []byte, cellOffset int) schemaRow {
 	// Decode col 4 (sql) — TEXT, the original CREATE TABLE statement
 	createSQL := readTextValue(page1, valPos, serialType4)
 
-	return schemaRow{typ: col0, name: col1, rootpage: int(rootpage), sql: createSQL}
+	return schemaRow{typ: col0, name: col1, tblName: col2, rootpage: int(rootpage), sql: createSQL}
 }
 
 // readTextValue extracts a TEXT value from page data given its serial type.

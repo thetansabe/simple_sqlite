@@ -43,17 +43,18 @@ func serialByteLen(serialType int64) int {
 // from a single table-leaf cell.
 //
 // How it works:
-//  1. Skip payload-size and rowid varints (they precede the record).
+//  1. Skip payload-size varint and capture the rowid varint (INTEGER PRIMARY KEY).
 //  2. Read the record header: headerLen + one serial type per column.
 //  3. Jump to the values section (recordStart + headerLen).
 //  4. Walk column by column using serialByteLen to skip unwanted columns,
 //     then call readTextValue at the target column.
+//  5. Serial type 0 means the column IS the rowid (INTEGER PRIMARY KEY alias).
 func readCellColumns(page []byte, cellOffset int, colIndices []int) []string {
 	pos := cellOffset
 	_, n := readVarint(page, pos)
 	pos += n // skip payload size
-	_, n = readVarint(page, pos)
-	pos += n // skip rowid
+	rowid, n := readVarint(page, pos) // capture rowid for INTEGER PRIMARY KEY
+	pos += n
 
 	recordStart := pos
 	headerLen, n := readVarint(page, pos)
@@ -82,7 +83,12 @@ func readCellColumns(page []byte, cellOffset int, colIndices []int) []string {
 		for i := range colIdx {
 			valPos += serialByteLen(serialTypes[i])
 		}
-		result[r] = readTextValue(page, valPos, serialTypes[colIdx])
+		if serialTypes[colIdx] == 0 {
+			// Serial type 0 = INTEGER PRIMARY KEY aliased to rowid — no stored bytes.
+			result[r] = fmt.Sprintf("%d", rowid)
+		} else {
+			result[r] = readTextValue(page, valPos, serialTypes[colIdx])
+		}
 	}
 	return result
 }
@@ -260,14 +266,188 @@ func gatherLeafPages(f *os.File, pageSize, rootPageNum int) ([][]byte, error) {
 	return leaves, nil
 }
 
+// ── Section 4: Index scan ─────────────────────────────────────────────────────
 
+// indexedColumn extracts the first column name from a CREATE INDEX SQL statement.
+// "CREATE INDEX idx_companies_country ON companies (country)" → "country"
+func indexedColumn(sql string) string {
+	start := strings.Index(sql, "(")
+	end := strings.LastIndex(sql, ")")
+	if start == -1 || end == -1 {
+		return ""
+	}
+	col := strings.TrimSpace(sql[start+1 : end])
+	parts := strings.Fields(col)
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.ToLower(parts[0])
+}
+
+// readIndexRecord parses a SQLite index record starting at pos.
+//
+// Index record layout:
+//
+//	[headerLen varint][serialType0 varint][serialType1 varint]
+//	[indexed_value bytes][rowid bytes]
+//
+// The rowid is always stored as the last column of the index record.
+func readIndexRecord(page []byte, pos int) (string, int64) {
+	recordStart := pos
+	headerLen, n := readVarint(page, pos)
+	pos += n
+	serialType0, n := readVarint(page, pos)
+	pos += n
+	serialType1, _ := readVarint(page, pos)
+
+	valPos := recordStart + int(headerLen)
+	colVal := readTextValue(page, valPos, serialType0)
+	valPos += serialByteLen(serialType0)
+	rowid := readIntValue(page, valPos, serialType1)
+	return colVal, rowid
+}
+
+// readIndexLeafCell parses an index leaf cell (page type 0x0A).
+//
+// Layout: [payload_size varint][record]
+func readIndexLeafCell(page []byte, cellOffset int) (string, int64) {
+	pos := cellOffset
+	_, n := readVarint(page, pos)
+	pos += n // skip payload size
+	return readIndexRecord(page, pos)
+}
+
+// readIndexInteriorCell parses an index interior cell (page type 0x02).
+//
+// Layout: [uint32 left_child][payload_size varint][record]
+func readIndexInteriorCell(page []byte, cellOffset int) (int, string, int64) {
+	leftChild := int(binary.BigEndian.Uint32(page[cellOffset : cellOffset+4]))
+	pos := cellOffset + 4
+	_, n := readVarint(page, pos)
+	pos += n // skip payload size
+	colVal, rowid := readIndexRecord(page, pos)
+	return leftChild, colVal, rowid
+}
+
+// searchIndex does a BFS over the index B-tree rooted at indexRoot,
+// collecting all rowids where the indexed value equals searchVal.
+//
+// Index page types:
+//
+//	0x0A = index leaf page     (8-byte header,  cells: [payload_size][record])
+//	0x02 = index interior page (12-byte header, cells: [uint32 left_child][payload_size][record])
+//
+// SQLite is a B-tree (not B+ tree): interior cells store actual records
+// (the dividing key IS the record). Interior cells must be checked for
+// matches, not just leaf cells.
+func searchIndex(f *os.File, pageSize, indexRoot int, searchVal string) ([]int64, error) {
+	var rowids []int64
+	queue := []int{indexRoot}
+
+	for len(queue) > 0 {
+		pageNum := queue[0]
+		queue = queue[1:]
+
+		page, err := readPageN(f, pageSize, pageNum)
+		if err != nil {
+			return nil, err
+		}
+
+		cellCount := int(binary.BigEndian.Uint16(page[3:5]))
+
+		switch page[0] {
+		case 0x0A: // index leaf page
+			for i := range cellCount {
+				ptrOffset := 8 + i*2
+				cellOffset := int(binary.BigEndian.Uint16(page[ptrOffset : ptrOffset+2]))
+				colVal, rowid := readIndexLeafCell(page, cellOffset)
+				if colVal == searchVal {
+					rowids = append(rowids, rowid)
+				}
+			}
+
+		case 0x02: // index interior page — cells also hold real records
+			for i := range cellCount {
+				ptrOffset := 12 + i*2
+				cellOffset := int(binary.BigEndian.Uint16(page[ptrOffset : ptrOffset+2]))
+				leftChild, colVal, rowid := readIndexInteriorCell(page, cellOffset)
+				if colVal == searchVal {
+					rowids = append(rowids, rowid)
+				}
+				queue = append(queue, leftChild)
+			}
+			// rightmost child is in the 12-byte header, not in a cell
+			rightmost := int(binary.BigEndian.Uint32(page[8:12]))
+			queue = append(queue, rightmost)
+		}
+	}
+
+	return rowids, nil
+}
+
+// readCellRowid reads the rowid (2nd varint) from a table leaf cell.
+//
+// Table leaf cell layout: [payload_size varint][rowid varint][record]
+func readCellRowid(page []byte, cellOffset int) int64 {
+	pos := cellOffset
+	_, n := readVarint(page, pos)
+	pos += n // skip payload size
+	rowid, _ := readVarint(page, pos)
+	return rowid
+}
+
+// lookupByRowid descends the table B-tree to find and return the cell
+// whose rowid equals the given value. Returns (page, cellOffset).
+//
+// Table interior page (0x05) cell: [uint32 left_child][varint key]
+// Navigation rule: rowid <= key → follow left_child; else continue; fallthrough → rightmost.
+func lookupByRowid(f *os.File, pageSize, tableRoot int, rowid int64) ([]byte, int, error) {
+	pageNum := tableRoot
+	for {
+		page, err := readPageN(f, pageSize, pageNum)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		cellCount := int(binary.BigEndian.Uint16(page[3:5]))
+
+		switch page[0] {
+		case 0x0D: // table leaf — linear scan for the rowid
+			for i := range cellCount {
+				ptrOffset := 8 + i*2
+				cellOffset := int(binary.BigEndian.Uint16(page[ptrOffset : ptrOffset+2]))
+				if readCellRowid(page, cellOffset) == rowid {
+					return page, cellOffset, nil
+				}
+			}
+			return nil, 0, fmt.Errorf("rowid %d not found in table", rowid)
+
+		case 0x05: // table interior — descend the correct branch
+			nextPage := int(binary.BigEndian.Uint32(page[8:12])) // rightmost default
+			for i := range cellCount {
+				ptrOffset := 12 + i*2
+				cellOffset := int(binary.BigEndian.Uint16(page[ptrOffset : ptrOffset+2]))
+				leftChild := int(binary.BigEndian.Uint32(page[cellOffset : cellOffset+4]))
+				key, _ := readVarint(page, cellOffset+4)
+				if rowid <= key {
+					nextPage = leftChild
+					break
+				}
+			}
+			pageNum = nextPage
+		}
+	}
+}
+
+// executeSelect executes a parsed SELECT query against the database at path.
 // separated by "|".
 //
 // Flow:
 //  1. Read sqlite_schema to find rootpage + CREATE TABLE sql for the table.
 //  2. Parse CREATE TABLE to map each requested column name to its index.
-//  3. Navigate to rootpage, read cell pointer array (leaf page, 8-byte header).
-//  4. For each cell, call readCellColumns and print the values.
+//  3. If a WHERE clause is present and a matching index exists, use the
+//     index scan path: searchIndex → lookupByRowid for each matched rowid.
+//  4. Otherwise fall back to the full table scan (gatherLeafPages BFS).
 func executeSelect(path string, q selectQuery) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -306,6 +486,37 @@ func executeSelect(path string, q selectQuery) error {
 			return fmt.Errorf("column %q not found in table %q", col, q.table)
 		}
 		colIndices[i] = idx
+	}
+
+	// If a WHERE clause is present, look for a covering index in sqlite_schema.
+	// A covering index must have: type='index', tblName==q.table, and its
+	// indexed column must match q.where.col.
+	if q.where != nil {
+		indexRootpage := 0
+		for _, row := range parseSchemaRows(page1) {
+			if row.typ == "index" && row.tblName == q.table &&
+				strings.EqualFold(indexedColumn(row.sql), q.where.col) {
+				indexRootpage = row.rootpage
+				break
+			}
+		}
+
+		if indexRootpage != 0 {
+			// Index scan: find matching rowids via the index, then point-lookup each row.
+			rowids, err := searchIndex(f, pageSize, indexRootpage, q.where.val)
+			if err != nil {
+				return err
+			}
+			for _, rowid := range rowids {
+				page, cellOffset, err := lookupByRowid(f, pageSize, rootpage, rowid)
+				if err != nil {
+					return err
+				}
+				values := readCellColumns(page, cellOffset, colIndices)
+				fmt.Println(strings.Join(values, "|"))
+			}
+			return nil
+		}
 	}
 
 	// resolve the WHERE col index
