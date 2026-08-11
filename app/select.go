@@ -131,11 +131,17 @@ func columnIndex(createSQL, colName string) int {
 
 // ── Step 4: parse SELECT with sqlparser ─────────────────────────────────────
 
+type whereClause struct {
+	col string // e.g. "color"
+	val string // e.g. "Yellow"
+}
+
 // selectQuery holds the parsed result of a SELECT statement.
 type selectQuery struct {
 	table   string
 	columns []string // column names requested; empty means SELECT *
 	isCount bool     // true for SELECT COUNT(*)
+	where   *whereClause
 }
 
 // parseSelect uses sqlparser to extract the table name and column list from a
@@ -164,6 +170,16 @@ func parseSelect(sql string) (selectQuery, error) {
 
 	var q selectQuery
 	q.table = table
+
+	// Extract WHERE clause if present (not used in this implementation).
+	if sel.Where != nil {
+		cmp, ok := sel.Where.Expr.(*sqlparser.ComparisonExpr) // downcast like: Dog d = (Dog) animal;
+		if ok && cmp.Operator == "=" {
+			col := cmp.Left.(*sqlparser.ColName).Name.String()
+			val := cmp.Right.(*sqlparser.SQLVal).Val
+			q.where = &whereClause{col: col, val: string(val)}
+		}
+	}
 
 	for _, expr := range sel.SelectExprs {
 		switch e := expr.(type) {
@@ -243,6 +259,12 @@ func executeSelect(path string, q selectQuery) error {
 		return err
 	}
 
+	// resolve the WHERE col index (this case is the index of color col)
+	whereIdx := -1
+	if q.where != nil {
+		whereIdx = columnIndex(createSQL, q.where.col)
+	}
+
 	// Leaf table page header (8 bytes, starts at offset 0 for non-page-1 pages):
 	//   [0]   page type (0x0D)
 	//   [1-2] first freeblock
@@ -252,8 +274,19 @@ func executeSelect(path string, q selectQuery) error {
 	// Cell pointer array starts immediately after at offset 8.
 	cellCount := int(binary.BigEndian.Uint16(page[3:5]))
 	for i := range cellCount {
+		// read the cell value and pointer offset to move to the next cell
 		ptrOffset := 8 + i*2
 		cellOffset := int(binary.BigEndian.Uint16(page[ptrOffset : ptrOffset+2]))
+
+		// read the value of WHERE column
+		// check if the col's value equal to the sql WHERE value or not
+		if whereIdx != -1 {
+			whereVal := readCellColumns(page, cellOffset, []int{whereIdx})[0]
+			if len(whereVal) == 0 || whereVal != q.where.val {
+				continue // skip - filter out this row if WHERE condition not met
+			}
+		}
+
 		values := readCellColumns(page, cellOffset, colIndices)
 		fmt.Println(strings.Join(values, "|"))
 	}

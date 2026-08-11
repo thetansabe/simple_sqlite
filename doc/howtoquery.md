@@ -214,6 +214,34 @@ for i := range cellCount {
 
 ### 2.4 Within-page vs cross-page traversal
 
+**What "interior" means:**
+
+A B-tree is a tree structure with **levels**. When a table grows too big to
+fit on one page, SQLite splits it across multiple pages and adds a routing
+layer on top. That routing layer is called an **interior page**.
+
+```
+SMALL TABLE (all rows fit on 1 page):
+
+  rootpage → [Leaf page 0x0D]
+               row1, row2, row3, row4   ← data lives here directly
+
+LARGE TABLE (rows overflow across many pages):
+
+  rootpage → [Interior page 0x05]       ← NO data here, only routing
+               ↙          ↓          ↘
+         [Leaf 0x0D] [Leaf 0x0D] [Leaf 0x0D]
+          rows 1-150  rows 151-300  rows 301-500
+```
+
+- **Leaf page (0x0D):** the bottom of the tree. Cells = actual row data.
+- **Interior page (0x05):** a middle/top layer. Cells = child page pointers + keys. No row data at all.
+
+The word "interior" comes from tree terminology: leaf nodes are at the edges,
+interior nodes are in the middle connecting them.
+
+---
+
 The cell pointer loop above only works when the **rootpage is a leaf (0x0D)**.
 There are two distinct kinds of traversal — the loop above handles one, stage
 rf3 requires the other:
