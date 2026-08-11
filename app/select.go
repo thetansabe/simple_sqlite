@@ -202,7 +202,65 @@ func parseSelect(sql string) (selectQuery, error) {
 
 // ── Step 5: executeSelect ────────────────────────────────────────────────────
 
-// executeSelect runs a SELECT query and prints one row per line with columns
+// readPageN reads page number pageNum (1-indexed) from f into a new byte slice.
+func readPageN(f *os.File, pageSize, pageNum int) ([]byte, error) {
+	page := make([]byte, pageSize)
+	if _, err := f.Seek(int64(pageNum-1)*int64(pageSize), 0); err != nil {
+		return nil, err
+	}
+	if _, err := f.Read(page); err != nil {
+		return nil, err
+	}
+	return page, nil
+}
+
+// gatherLeafPages does a BFS from rootPageNum, following interior page child
+// pointers until it has collected every leaf page in the table's B-tree.
+//
+// Interior page (0x05) header layout (12 bytes):
+//
+//	[0]   page type
+//	[1-2] first freeblock
+//	[3-4] cell count
+//	[5-6] cell content start
+//	[7]   fragmented free bytes
+//	[8-11] rightmost child page number  ← extra 4 bytes vs leaf header
+//
+// Interior cell layout: [uint32 left_child][varint key]
+// Cell pointer array starts at offset 12 (not 8 like leaf pages).
+func gatherLeafPages(f *os.File, pageSize, rootPageNum int) ([][]byte, error) {
+	var leaves [][]byte
+	queue := []int{rootPageNum}
+	for len(queue) > 0 {
+		pageNum := queue[0]
+		queue = queue[1:]
+
+		page, err := readPageN(f, pageSize, pageNum)
+		if err != nil {
+			return nil, err
+		}
+
+		switch page[0] {
+		case 0x0D: // leaf table page — contains row data
+			leaves = append(leaves, page)
+
+		case 0x05: // interior table page — contains child pointers only
+			cellCount := int(binary.BigEndian.Uint16(page[3:5]))
+			for i := range cellCount {
+				ptrOffset := 12 + i*2 // cell pointer array starts at 12, not 8
+				cellOffset := int(binary.BigEndian.Uint16(page[ptrOffset : ptrOffset+2]))
+				leftChild := int(binary.BigEndian.Uint32(page[cellOffset : cellOffset+4]))
+				queue = append(queue, leftChild)
+			}
+			// rightmost child is in the header, not in a cell
+			rightmost := int(binary.BigEndian.Uint32(page[8:12]))
+			queue = append(queue, rightmost)
+		}
+	}
+	return leaves, nil
+}
+
+
 // separated by "|".
 //
 // Flow:
@@ -250,45 +308,38 @@ func executeSelect(path string, q selectQuery) error {
 		colIndices[i] = idx
 	}
 
-	// Seek to the rootpage. Pages are 1-indexed: page N starts at (N-1)*pageSize.
-	if _, err := f.Seek(int64(rootpage-1)*int64(pageSize), 0); err != nil {
-		return err
-	}
-	page := make([]byte, pageSize)
-	if _, err := f.Read(page); err != nil {
-		return err
-	}
-
-	// resolve the WHERE col index (this case is the index of color col)
+	// resolve the WHERE col index
 	whereIdx := -1
 	if q.where != nil {
 		whereIdx = columnIndex(createSQL, q.where.col)
 	}
 
-	// Leaf table page header (8 bytes, starts at offset 0 for non-page-1 pages):
-	//   [0]   page type (0x0D)
-	//   [1-2] first freeblock
-	//   [3-4] cell count       ← number of rows
-	//   [5-6] cell content start
-	//   [7]   fragmented free bytes
-	// Cell pointer array starts immediately after at offset 8.
-	cellCount := int(binary.BigEndian.Uint16(page[3:5]))
-	for i := range cellCount {
-		// read the cell value and pointer offset to move to the next cell
-		ptrOffset := 8 + i*2
-		cellOffset := int(binary.BigEndian.Uint16(page[ptrOffset : ptrOffset+2]))
+	// Collect all leaf pages via BFS — handles both single-leaf (small table)
+	// and interior-rooted (large table) B-trees transparently.
+	leaves, err := gatherLeafPages(f, pageSize, rootpage)
+	if err != nil {
+		return err
+	}
 
-		// read the value of WHERE column
-		// check if the col's value equal to the sql WHERE value or not
-		if whereIdx != -1 {
-			whereVal := readCellColumns(page, cellOffset, []int{whereIdx})[0]
-			if len(whereVal) == 0 || whereVal != q.where.val {
-				continue // skip - filter out this row if WHERE condition not met
+	for _, page := range leaves {
+		// Leaf page header (8 bytes): cell pointer array starts at offset 8.
+		//   [0]   page type (0x0D)
+		//   [3-4] cell count
+		cellCount := int(binary.BigEndian.Uint16(page[3:5]))
+		for i := range cellCount {
+			ptrOffset := 8 + i*2
+			cellOffset := int(binary.BigEndian.Uint16(page[ptrOffset : ptrOffset+2]))
+
+			if whereIdx != -1 {
+				whereVal := readCellColumns(page, cellOffset, []int{whereIdx})[0]
+				if whereVal != q.where.val {
+					continue
+				}
 			}
-		}
 
-		values := readCellColumns(page, cellOffset, colIndices)
-		fmt.Println(strings.Join(values, "|"))
+			values := readCellColumns(page, cellOffset, colIndices)
+			fmt.Println(strings.Join(values, "|"))
+		}
 	}
 	return nil
 }
